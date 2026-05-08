@@ -1,0 +1,8 @@
+# 忽略所有数据文件，只让 AI 读代码
+*.sxm
+*.dat
+*.csv
+*.npy
+*.h5
+__pycache__/
+.venv/

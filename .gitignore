@@ -1,0 +1,14 @@
+# 绝对不能开源的敏感信息
+.env
+secrets.json
+
+# 实验原始数据（太大了，且可能未发表）
+*.sxm
+*.dat
+data/raw/
+
+# Python 缓存
+__pycache__/
+*.pyc
+.venv/
+data/
