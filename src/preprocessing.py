@@ -1,243 +1,400 @@
 """
-图像预处理模块
+预处理模块（流式精简版）
 职责：
-  - 批次侦察与文件排序
-  - ROI 标定与 UI 掩膜生成
-  - 单帧数据加载（纯净 / 脏数据双轨制）
-  - 全局归一化与时空图构建
-  - 数据持久化（npy 文件输出）
-  - 数据对抗增强（可选工具）
+  - 批次侦察（.img 或 .png 单一格式）
+  - 固定比例多 ROI 映射（与窗口缩放解耦）
+  - 双轨单帧加载（纯净 / 脏 UI 屏蔽）
+  - 前一帧漂移追踪校正（失败不更新模板）
+  - 流式生成器（内存安全，一次解码多 ROI 并行）
+  - memmap 持久化辅助
 
-注意：本模块不包含任何可视化功能，所有绘图任务请使用 visualization.py。
+注意：不包含背景扣除，适合以相对强度/位置为特征的分析。
 """
 
 import cv2
 import numpy as np
 from pathlib import Path
-from tqdm import tqdm
+import logging
+from typing import Dict, List, Tuple, Optional, Generator, Any
+
+logging.basicConfig(level=logging.INFO,
+                    format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
 # =====================================================================
-# 第一部分：批次侦察与控制流辅助
+# 硬编码固定比例 ROI（物理几何，相对截图中心）
+# 比例推导见系统提示词，不可随意修改
 # =====================================================================
+LEFT_RATIO   = -25 / 63   # ≈ -0.3968
+RIGHT_RATIO  =  25 / 63   # ≈  0.3968
+TOP_RATIO    =   2 / 19   # ≈  0.1053
+BOTTOM_RATIO =  -6 / 19   # ≈ -0.3158
 
-def analyze_batch_context(input_folder):
-    """
-    功能: 批次侦察兵。扫描输入文件夹，判断这是纯净训练批次还是实拍脏数据批次。
-    返回: 字典 context，供主程序进行路由分发。
-    """
-    folder_path = Path(input_folder)
-    if not folder_path.exists():
-        raise FileNotFoundError(f"文件夹不存在: {folder_path}")
+def ratio_roi_to_pixels(image_shape: Tuple[int, int]) -> Tuple[int, int, int, int]:
+    """将硬编码比例转换为当前帧的像素矩形 (x, y, w, h)。"""
+    H, W = image_shape
+    cx, cy = W / 2.0, H / 2.0
+    x_left  = cx + LEFT_RATIO * W
+    x_right = cx + RIGHT_RATIO * W
+    y_top   = cy - TOP_RATIO * H      # 像素 Y 向下，故减
+    y_bottom= cy - BOTTOM_RATIO * H   # BOTTOM_RATIO 为负，减负得加
+    x = int(round(x_left))
+    y = int(round(y_top))
+    w = int(round(x_right - x_left))
+    h = int(round(y_bottom - y_top))
+    # 边界保护
+    x = max(0, min(x, W - 1))
+    y = max(0, min(y, H - 1))
+    w = min(w, W - x)
+    h = min(h, H - y)
+    return x, y, w, h
 
-    all_files = list(folder_path.glob("*.*"))
-    image_files = [f for f in all_files if f.suffix.lower() in ['.img', '.png', '.jpg']]
+# =====================================================================
+# 批次侦察（确保单一格式）
+# =====================================================================
+def analyze_batch_context(input_folder: str) -> Dict[str, Any]:
+    """扫描文件夹，返回 batch_type ('clean' 或 'dirty') 及文件列表。"""
+    folder = Path(input_folder)
+    if not folder.exists():
+        raise FileNotFoundError(f"文件夹不存在: {folder}")
 
-    if not image_files:
-        raise ValueError(f"在 {folder_path} 中没有找到任何图片文件！")
+    files = list(folder.glob("*.*"))
+    img_files = [f for f in files if f.suffix.lower() in ['.img', '.png', '.jpg']]
+    if not img_files:
+        raise ValueError(f"未在 {folder} 中发现任何图像文件。")
 
-    first_image = image_files[0]
-    ext = first_image.suffix.lower()
+    # 确保单一格式
+    exts = set(f.suffix.lower() for f in img_files)
+    if len(exts) > 1:
+        raise ValueError(f"检测到混合格式 {exts}，当前要求单一批次仅一种格式。")
 
-    context = {
-        "first_frame_path": first_image,
-        "image_list": image_files,
-        "total_count": len(image_files)
+    ctx = {
+        "first_frame": img_files[0],
+        "image_list": img_files,
+        "total_count": len(img_files),
+        "batch_type": "clean" if img_files[0].suffix.lower() == '.img' else "dirty"
     }
+    if ctx["batch_type"] == "dirty":
+        template = folder / "ui_mask_template.png"
+        if not template.exists():
+            raise FileNotFoundError("脏数据批次缺少 ui_mask_template.png。")
+        ctx["template_path"] = template
 
-    if ext == '.img':
-        context["batch_type"] = "clean"
-        print(f"🔍 侦察完毕：检测到 {context['total_count']} 张 .img 纯净数据。")
+    logger.info(f"侦察完毕：{ctx['total_count']} 帧 {ctx['batch_type']} 数据。")
+    return ctx
 
-    elif ext in ['.png', '.jpg']:
-        context["batch_type"] = "dirty"
-        template_path = folder_path / "ui_mask_template.png"
-        if not template_path.exists():
-            raise FileNotFoundError(
-                f"\n🚨 致命错误：这是实拍批次，但在文件夹中找不到 'ui_mask_template.png'！\n"
-                f"请放入全黑的UI掩膜底片后再运行程序。"
-            )
-        context["template_path"] = template_path
-        print(f"🔍 侦察完毕：检测到 {context['total_count']} 张实拍脏数据，且 UI 底片已就绪。")
-
-    return context
-
-# =====================================================================
-# 第二部分：标定与掩膜生成
-# =====================================================================
-
-def get_roi_from_first_frame(image_path):
-    """
-    功能: 弹出一个 GUI 窗口，让用户手工框选核心的衍射条纹区域。
-    注意: 若图像为 16-bit,将临时映射到 8-bit 以便显示，但不影响原数据。
-    """
-    img = cv2.imread(str(image_path), cv2.IMREAD_UNCHANGED)
-    if img is None:
-        raise ValueError(f"无法读取图片: {image_path}")
-
-    # 16-bit 图像临时映射到 8-bit（仅用于显示）
-    if img.dtype == np.uint16:
-        img_display = cv2.normalize(img, None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U)
-    else:
-        img_display = img
-
-    print("\n" + "=" * 40 + "\n📢 标定模式启动\n请框选核心衍射条纹并按【回车键】确认。\n" + "=" * 40 + "\n")
-    roi_rect = cv2.selectROI("Select RHEED ROI", img_display, showCrosshair=True, fromCenter=False)
-    cv2.destroyAllWindows()
-
-    if roi_rect[2] == 0 or roi_rect[3] == 0:
-        raise ValueError("标定取消或未画框！程序中断。")
-    return roi_rect
-
-def generate_ui_mask(template_path, roi_rect, target_resolution=(256, 256)):
-    """
-    功能: 读取全黑底片，提取像素级的绝对掩膜 (UI 污染区)。
-    规定: 缩放时必须使用最近邻插值，以保证掩膜边缘仍是锐利的布尔值。
-    """
-    template = cv2.imread(str(template_path), cv2.IMREAD_GRAYSCALE)
-    x, y, w, h = roi_rect
-    cropped_template = template[y:y + h, x:x + w]
-    # 最近邻插值，确保 UI 线条一刀切
-    resized_template = cv2.resize(cropped_template, target_resolution, interpolation=cv2.INTER_NEAREST)
-    ui_mask = resized_template > 10
-    return ui_mask
-
-# =====================================================================
-# 第三部分：归一化与单帧加载器（双轨制）
-# =====================================================================
-
-def normalize_physics_matrix(matrix, global_min=None, global_max=None):
-    """
-    功能: 将矩阵映射到 0.0 ~ 1.0。
-    参数: 
-        global_min, global_max : 如果提供，则执行基于全局范围的归一化；
-                                否则对矩阵进行独立归一化。
-    说明: 使用 np.nanmin / np.nanmax 安全处理 NaN 像素。
-    """
-    if global_min is None or global_max is None:
-        min_val = np.nanmin(matrix)
-        max_val = np.nanmax(matrix)
-    else:
-        min_val, max_val = global_min, global_max
-
-    if max_val - min_val == 0:
-        return matrix - min_val  # 全零矩阵，避免除零
-    return (matrix - min_val) / (max_val - min_val)
-
-def process_clean_img_file(image_path, roi_rect, target_resolution=(256, 256)):
-    """
-    轨道 A:纯净数据流。
-    处理前期的高位深纯净训练数据 (.img)，输出未归一化的 float32 矩阵。
-    """
-    img = cv2.imread(str(image_path), cv2.IMREAD_UNCHANGED)
-    x, y, w, h = roi_rect
-    cropped_img = img[y:y + h, x:x + w]
-
-    if len(cropped_img.shape) == 3:
-        cropped_img = cv2.cvtColor(cropped_img, cv2.COLOR_BGR2GRAY)
-
-    float_matrix = cropped_img.astype(np.float32)
-    # 物理插值（缩小）保留积分强度
-    resized_matrix = cv2.resize(float_matrix, target_resolution, interpolation=cv2.INTER_AREA)
-    return resized_matrix  # 归一化延迟至全局处理
-
-def process_dirty_png_file(image_path, roi_rect, ui_mask, target_resolution=(256, 256)):
-    """
-    轨道 B:实拍数据流。
-    处理后期的实拍实验截图 (.png)，输出未归一化的 float32 矩阵,UI 区域已置为 NaN。
-    """
-    img = cv2.imread(str(image_path))
-    x, y, w, h = roi_rect
-    cropped_img = img[y:y + h, x:x + w]
-    gray_img = cv2.cvtColor(cropped_img, cv2.COLOR_BGR2GRAY)
-
-    float_matrix = gray_img.astype(np.float32)
-    resized_matrix = cv2.resize(float_matrix, target_resolution, interpolation=cv2.INTER_AREA)
-
-    # 物理屏蔽：将 UI 污染像素彻底移除
-    resized_matrix[ui_mask] = np.nan
-    return resized_matrix  # 归一化延迟至全局处理
-
-# =====================================================================
-# 第四部分：实验批次全局处理流水线
-# =====================================================================
-
-def process_experiment_folder(input_folder, target_resolution=(256, 256)):
-    """
-    实验批次主处理函数。
-    流程：
-      1. 侦察批次类型（当前仅支持 dirty 批次）。
-      2. 打开第一帧进行 ROI 标定，生成 UI 掩膜。
-      3. 按文件名数字排序加载所有帧，执行裁剪、缩放、NaN 屏蔽。
-      4. 计算全局强度极值，对全部帧执行全局归一化。
-      5. 构建时空图立方体 (T, H, W) 及有效性掩膜。
-      6. 保存立方体与掩膜至 processed/ 子目录。
-    返回:
-        spacetime_cube : np.ndarray, 形状 (T, 256, 256)，已归一化
-        validity_mask  : np.ndarray, 形状 (T, 256, 256)，True 表示有效像素
-    """
-    # ---- 1. 侦察 ----
-    context = analyze_batch_context(input_folder)
-    if context["batch_type"] != "dirty":
-        raise NotImplementedError("当前实验批次处理仅支持 dirty (PNG) 模式。")
-
-    # ---- 2. 标定与掩膜 ----
-    roi_rect = get_roi_from_first_frame(context["first_frame_path"])
-    ui_mask = generate_ui_mask(context["template_path"], roi_rect, target_resolution)
-
-    # ---- 3. 帧排序 ----
-    png_files = [f for f in context["image_list"] if f.suffix.lower() == '.png']
-    # 按数字文件名排序（支持非 1 开始的序列）
+def sort_image_files(file_list: List[Path]) -> List[Path]:
+    """按数字文件名排序，失败则按字符串顺序并警告。"""
     try:
-        png_files_sorted = sorted(png_files, key=lambda f: int(f.stem))
+        return sorted(file_list, key=lambda f: int(f.stem))
     except ValueError:
-        png_files_sorted = sorted(png_files, key=lambda f: f.stem)
-        print("⚠️ 警告：文件名不完全为数字，已按字符串顺序排列，请确认时间顺序无误。")
-
-    if not png_files_sorted:
-        raise ValueError("未发现任何 PNG 文件。")
-
-    print(f"📂 开始处理 {len(png_files_sorted)} 帧...")
-    frames = []
-    for file_path in tqdm(png_files_sorted, desc="帧预处理"):
-        frame = process_dirty_png_file(file_path, roi_rect, ui_mask, target_resolution)
-        frames.append(frame)
-
-    # ---- 4. 全局归一化 ----
-    stacked = np.stack(frames, axis=0)  # (T, H, W)
-    global_min = np.nanmin(stacked)
-    global_max = np.nanmax(stacked)
-    print(f"📊 全局强度范围: [{global_min:.3f}, {global_max:.3f}]")
-
-    normalized_frames = [normalize_physics_matrix(f, global_min, global_max) for f in frames]
-    spacetime_cube = np.stack(normalized_frames, axis=0)  # 时空立方体
-
-    # 有效性掩膜：与 NaN 相反
-    validity_mask = ~np.isnan(spacetime_cube)
-
-    # ---- 5. 持久化 ----
-    output_dir = Path(input_folder) / "processed"
-    output_dir.mkdir(exist_ok=True)
-    np.save(output_dir / "spacetime_cube.npy", spacetime_cube)
-    np.save(output_dir / "validity_mask.npy", validity_mask)
-    print(f"💾 时空立方体已保存至 {output_dir / 'spacetime_cube.npy'}")
-
-    return spacetime_cube, validity_mask
+        logger.warning("文件名非纯数字，已按字符串排序，请确认时间顺序。")
+        return sorted(file_list, key=lambda f: f.stem)
 
 # =====================================================================
-# 第五部分：数据对抗增强（工具函数）
+# 单帧加载器（双轨，无背景扣除）
 # =====================================================================
+def read_img_clean(file_path: Path) -> np.ndarray:
+    """读取 .img 文件，返回 float32 全图。"""
+    img = cv2.imread(str(file_path), cv2.IMREAD_UNCHANGED)
+    if img is None:
+        raise IOError(f"无法读取 {file_path}")
+    if img.dtype == np.uint16:
+        img = img.astype(np.float32)
+    else:
+        img = img.astype(np.float32)
+    if len(img.shape) == 3:
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    return img
 
-def simulate_ui_degradation(clean_matrix):
+def read_png_dirty(file_path: Path, ui_mask: Optional[np.ndarray] = None) -> np.ndarray:
+    """读取 .png 截图，返回 float32 全图，UI 区域置 NaN。"""
+    img = cv2.imread(str(file_path))
+    if img is None:
+        raise IOError(f"无法读取 {file_path}")
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    if ui_mask is not None:
+        # 若掩膜尺寸变化则用最近邻缩放以保持锐利布尔
+        if ui_mask.shape != gray.shape:
+            ui_mask = cv2.resize(ui_mask.astype(np.uint8),
+                                 (gray.shape[1], gray.shape[0]),
+                                 interpolation=cv2.INTER_NEAREST).astype(bool)
+        gray[ui_mask.astype(bool)] = np.nan
+    return gray
+
+def generate_full_ui_mask(template_path: Path) -> np.ndarray:
+    """从全黑底片生成全图 UI 污染掩膜（True=污染）。"""
+    tmpl = cv2.imread(str(template_path), cv2.IMREAD_GRAYSCALE)
+    if tmpl is None:
+        raise IOError(f"无法读取模板 {template_path}")
+    mask = tmpl > 10
+    logger.info(f"全图 UI 掩膜已加载，{np.sum(mask)} 像素被屏蔽。")
+    return mask
+
+# =====================================================================
+# 前一帧漂移追踪器
+# =====================================================================
+class DriftTracker:
+    """利用前一帧模板匹配实现束流漂移补偿，失败不更新模板。"""
+    def __init__(self,
+                 search_margin: int = 15,
+                 corr_threshold: float = 0.3,
+                 black_threshold: float = 1.0):
+        self.search_margin = search_margin
+        self.corr_threshold = corr_threshold
+        self.black_threshold = black_threshold
+        self.template = None          # 前一帧 ROI（原生尺寸）
+        self.template_shape = None
+
+    def initialize(self, roi_image: np.ndarray):
+        """用第一帧的 ROI 子图初始化模板。"""
+        self.template = roi_image.copy()
+        self.template_shape = roi_image.shape[:2]
+        logger.debug(f"DriftTracker 初始化，模板尺寸 {self.template_shape}")
+
+    def _sanitize(self, img: np.ndarray) -> np.ndarray:
+        """替换 NaN 为 0 供 OpenCV 处理。"""
+        out = img.copy()
+        out[np.isnan(out)] = 0.0
+        return out
+
+    def track(self, full_frame: np.ndarray,
+              nominal_rect: Tuple[int, int, int, int]
+              ) -> Tuple[Tuple[int, int, int, int], Tuple[float, float], bool]:
+        """
+        在 full_frame 中搜索模板，返回校正矩形、漂移向量、可靠性。
+        若不可靠，不更新内部模板（由调用方根据返回值决定）。
+        """
+        x, y, w, h = nominal_rect
+        H, W = full_frame.shape[:2]
+
+        if self.template is None:
+            return nominal_rect, (0.0, 0.0), False
+
+        # 模板过暗（束斑消失）→ 追踪失败，不更新模板
+        if np.nanmean(self.template) < self.black_threshold:
+            return nominal_rect, (0.0, 0.0), False
+
+        # 搜索区域
+        sx1 = max(0, x - self.search_margin)
+        sy1 = max(0, y - self.search_margin)
+        sx2 = min(W, x + w + self.search_margin)
+        sy2 = min(H, y + h + self.search_margin)
+        if sx1 >= sx2 or sy1 >= sy2:
+            return nominal_rect, (0.0, 0.0), False
+
+        search_region = self._sanitize(full_frame[sy1:sy2, sx1:sx2])
+        tmpl = self._sanitize(self.template)
+
+        # 模板匹配
+        res = cv2.matchTemplate(search_region, tmpl, cv2.TM_CCOEFF_NORMED)
+        _, max_val, _, max_loc = cv2.minMaxLoc(res)
+        if max_val < self.corr_threshold:
+            return nominal_rect, (0.0, 0.0), False
+
+        dx = max_loc[0] - self.search_margin
+        dy = max_loc[1] - self.search_margin
+
+        corrected_x = int(x + dx)
+        corrected_y = int(y + dy)
+        corrected_x = max(0, min(corrected_x, W - w))
+        corrected_y = max(0, min(corrected_y, H - h))
+        corrected_rect = (corrected_x, corrected_y, w, h)
+
+        # 注意：不在内部更新模板，由调用方在确认可靠后显式更新
+        return corrected_rect, (dx, dy), True
+
+# =====================================================================
+# 流式生成器（核心）
+# =====================================================================
+def stream_rheed_frames(
+    input_folder: str,
+    roi_ratios: Optional[List[Dict[str, float]]] = None,
+    target_size: Tuple[int, int] = (128, 128),
+    enable_drift: bool = True,
+    drift_search_margin: int = 15,
+    drift_corr_threshold: float = 0.3,
+    drift_black_threshold: float = 1.0
+) -> Generator[Dict[str, Any], None, None]:
     """
-    功能: 对纯净数据反向污染。在完美矩阵上人为注入 NaN 破坏点，
-         用于训练下游算法的鲁棒性。
+    流式读取 RHEED 图像序列，提取多 ROI，前一帧漂移校正。
+    
+    参数：
+        input_folder : 文件夹路径，仅含一种格式（.img 或 .png）。
+        roi_ratios   : ROI 比例定义列表，默认使用硬编码单 RO。
+        target_size  : 输出 ROI 的尺寸 (宽, 高)。
+        enable_drift : 是否启用漂移校正。
+        drift_search_margin : 搜索扩展像素。
+        drift_corr_threshold: 相关系数阈值。
+        drift_black_threshold: 模板最暗平均强度。
+    
+    生成器 yield 字典：
+        {
+            'frame_id': int,
+            'rois': {'roi_name': np.ndarray(目标尺寸), ...},
+            'drift': (dx, dy),
+            'drift_reliable': bool,
+            'metadata': {...}
+        }
     """
-    degraded_matrix = clean_matrix.copy()
-    h, w = degraded_matrix.shape
+    ctx = analyze_batch_context(input_folder)
+    is_clean = ctx["batch_type"] == "clean"
+    image_files = sort_image_files(ctx["image_list"])
 
-    # 中心区域十字准星污染（宽 3 像素）
-    center_y, center_x = h // 2, w // 2
-    degraded_matrix[center_y - 1:center_y + 2, :] = np.nan
-    degraded_matrix[:, center_x - 1:center_x + 2] = np.nan
+    # 加载 UI 掩膜（仅脏数据）
+    ui_mask = None
+    if not is_clean:
+        ui_mask = generate_full_ui_mask(ctx["template_path"])
 
-    return degraded_matrix
+    # 默认 ROI：硬编码固定框
+    if roi_ratios is None:
+        roi_ratios = [{"name": "main_spot",
+                       "left": LEFT_RATIO, "right": RIGHT_RATIO,
+                       "top": TOP_RATIO, "bottom": BOTTOM_RATIO}]
+
+    # 初始化漂移追踪器
+    tracker = None
+    if enable_drift:
+        tracker = DriftTracker(search_margin=drift_search_margin,
+                               corr_threshold=drift_corr_threshold,
+                               black_threshold=drift_black_threshold)
+
+    for idx, file_path in enumerate(image_files):
+        # ---- 1. 加载全图 ----
+        if is_clean:
+            full = read_img_clean(file_path)
+        else:
+            full = read_png_dirty(file_path, ui_mask)
+
+        H, W = full.shape[:2]
+
+        # ---- 2. 计算所有 ROI 的名义矩形 ----
+        nominal_rects = []
+        for roi_def in roi_ratios:
+            if all(k in roi_def for k in ("left","right","top","bottom")):
+                left  = int(W/2 + roi_def["left"] * W)
+                right = int(W/2 + roi_def["right"] * W)
+                top   = int(H/2 - roi_def["top"] * H)
+                bottom= int(H/2 - roi_def["bottom"] * H)
+                x = min(left, right); y = min(top, bottom)
+                w = abs(right - left); h = abs(bottom - top)
+                x = max(0, min(x, W-1))
+                y = max(0, min(y, H-1))
+                w = min(w, W - x)
+                h = min(h, H - y)
+                rect = (x, y, w, h)
+            else:
+                raise ValueError(f"ROI 定义缺少键: {roi_def}")
+            nominal_rects.append(rect)
+
+        # ---- 3. 漂移校正 ----
+        primary_rect = nominal_rects[0]   # 所有 ROI 共用同一漂移
+        drift_vec = (0.0, 0.0)
+        drift_ok = False
+
+        if enable_drift and tracker is not None:
+            if idx == 0:
+                # 第一帧初始化模板（原生尺寸）
+                x0, y0, w0, h0 = primary_rect
+                init_roi = full[y0:y0+h0, x0:x0+w0].copy()
+                tracker.initialize(init_roi)
+                corrected_rects = nominal_rects
+            else:
+                corr_primary, drift_vec, drift_ok = tracker.track(full, primary_rect)
+                dx = corr_primary[0] - primary_rect[0]
+                dy = corr_primary[1] - primary_rect[1]
+                corrected_rects = []
+                for rect in nominal_rects:
+                    nx = rect[0] + dx
+                    ny = rect[1] + dy
+                    nx = max(0, min(nx, W - rect[2]))
+                    ny = max(0, min(ny, H - rect[3]))
+                    corrected_rects.append((nx, ny, rect[2], rect[3]))
+        else:
+            corrected_rects = nominal_rects
+
+        # ---- 4. 提取 ROI 并缩放到目标尺寸 ----
+        roi_dict = {}
+        for (x, y, w, h), roi_def in zip(corrected_rects, roi_ratios):
+            sub = full[y:y+h, x:x+w].copy()
+            # 缩放处理 NaN
+            nan_mask = np.isnan(sub)
+            sub_temp = np.where(nan_mask, 0.0, sub)
+            if sub.shape[0] != target_size[1] or sub.shape[1] != target_size[0]:
+                sub_resized = cv2.resize(sub_temp, target_size,
+                                         interpolation=cv2.INTER_AREA)
+                if np.any(nan_mask):
+                    nan_mask_u8 = nan_mask.astype(np.uint8) * 255
+                    nan_mask_rz = cv2.resize(nan_mask_u8, target_size,
+                                             interpolation=cv2.INTER_NEAREST) > 127
+                    sub_resized[nan_mask_rz] = np.nan
+            else:
+                sub_resized = sub_temp
+                if np.any(nan_mask):
+                    sub_resized[nan_mask] = np.nan
+            roi_dict[roi_def["name"]] = sub_resized.astype(np.float32)
+
+        # ---- 5. 若漂移成功，更新模板（原生尺寸，未缩放） ----
+        if enable_drift and tracker is not None and idx > 0 and drift_ok:
+            px, py, pw, ph = corrected_rects[0]
+            new_tmpl = full[py:py+ph, px:px+pw].copy()
+            tracker.template = new_tmpl   # 关键：仅成功时更新
+
+        # ---- 6. 组装输出 ----
+        yield {
+            'frame_id': idx,
+            'rois': roi_dict,
+            'drift': drift_vec,
+            'drift_reliable': drift_ok,
+            'metadata': {
+                'file_name': file_path.name,
+                'original_shape': (H, W),
+                'primary_nominal_rect': primary_rect
+            }
+        }
+
+# =====================================================================
+# memmap 持久化辅助
+# =====================================================================
+def process_to_memmap(input_folder: str,
+                      output_dir: str,
+                      roi_ratios: Optional[List[Dict[str, float]]] = None,
+                      target_size: Tuple[int, int] = (128, 128),
+                      enable_drift: bool = True,
+                      **drift_kwargs) -> None:
+    """将流式输出写入内存映射文件，每个 ROI 一个 .dat。"""
+    out_path = Path(output_dir)
+    out_path.mkdir(parents=True, exist_ok=True)
+
+    # 第一趟统计
+    roi_names = None
+    total = 0
+    for data in stream_rheed_frames(input_folder, roi_ratios, target_size,
+                                    enable_drift, **drift_kwargs):
+        if roi_names is None:
+            roi_names = list(data['rois'].keys())
+        total += 1
+    if total == 0:
+        raise RuntimeError("无有效帧。")
+
+    H, W = target_size[1], target_size[0]
+    memmaps = {}
+    for name in roi_names:
+        mm = np.memmap(str(out_path / f"{name}.dat"), dtype='float32',
+                       mode='w+', shape=(total, H, W))
+        memmaps[name] = mm
+
+    # 第二趟填充
+    idx = 0
+    for data in stream_rheed_frames(input_folder, roi_ratios, target_size,
+                                    enable_drift, **drift_kwargs):
+        for name, sub in data['rois'].items():
+            memmaps[name][idx] = sub
+        idx += 1
+        if idx % 100 == 0:
+            logger.info(f"写入进度 {idx}/{total}")
+
+    for name, mm in memmaps.items():
+        mm.flush()
+        np.save(out_path / f"{name}_shape.npy", np.array([total, H, W]))
+    logger.info("memmap 写入完毕。")
